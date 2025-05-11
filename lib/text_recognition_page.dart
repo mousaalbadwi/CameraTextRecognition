@@ -1,19 +1,24 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:flutter_tts/flutter_tts.dart';
-import 'package:path/path.dart';
+import 'package:camera/camera.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'cloud_vision_ocr.dart';
 
-class TestRecognitionPage extends StatefulWidget {
-  const TestRecognitionPage({super.key});
+class TextRecognitionPage extends StatefulWidget {
+  const TextRecognitionPage({super.key});
   @override
-  State<TestRecognitionPage> createState() => _TestRecognitionPageState();
+  State<TextRecognitionPage> createState() => _TextRecognitionPageState();
 }
 
-class _TestRecognitionPageState extends State<TestRecognitionPage> {
-  bool _busy = false;
+class _TextRecognitionPageState extends State<TextRecognitionPage> {
+  CameraController? _camCtrl;
+  bool _cameraReady = false;
+  bool _processing = false;
+  bool _flashOn = false;
   List<String> _paragraphs = [];
   List<String> _lines = [];
   final FlutterTts _tts = FlutterTts();
@@ -21,49 +26,87 @@ class _TestRecognitionPageState extends State<TestRecognitionPage> {
   @override
   void initState() {
     super.initState();
+    dotenv.load(fileName: '.env');
+    _initCamera();
     _tts.awaitSpeakCompletion(true);
     _tts.setSpeechRate(0.4);
   }
 
-  Future<void> _analyzeImage() async {
-    setState(() => _busy = true);
-    try {
-      // 1) حمّل البايت من الأصول
-      final data = await rootBundle.load('assets/test.jpg');
-      final bytes = data.buffer.asUint8List();
+  Future<void> _initCamera() async {
+    final cams = await availableCameras();
+    final back = cams.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cams.first,
+    );
+    _camCtrl = CameraController(
+      back,
+      ResolutionPreset.max,          // أقصى دقة
+      enableAudio: false,
+    );
+    await _camCtrl!.initialize();
 
-      // 2) استخرج النص الكامل
+    // autofocus & auto exposure
+    await _camCtrl!.setFocusMode(FocusMode.auto);
+    await _camCtrl!.setExposureMode(ExposureMode.auto);
+
+    if (!mounted) return;
+    setState(() => _cameraReady = true);
+  }
+
+  Future<void> _toggleFlash() async {
+    if (!_cameraReady) return;
+    _flashOn = !_flashOn;
+    await _camCtrl!.setFlashMode(
+      _flashOn ? FlashMode.torch : FlashMode.off,
+    );
+    setState(() {});
+  }
+
+  Future<void> _captureAndProcess() async {
+    if (_processing || !_cameraReady) return;
+    setState(() => _processing = true);
+
+    try {
+      final tmp = await getTemporaryDirectory();
+      final path = join(tmp.path, '${DateTime.now().millisecondsSinceEpoch}.jpg');
+      final XFile file = await _camCtrl!.takePicture();
+      await file.saveTo(path);
+      final Uint8List bytes = await File(path).readAsBytes();
+
       final rawText = (await CloudVisionOcr.recognizeText(bytes)).trim();
 
-      // 3) قسم إلى فقرات عبر السطر الفارغ
-      final paras = rawText
-          .split(RegExp(r'\n\s*\n'))
-          .map((p) => p.replaceAll('\n', ' ').trim())
-          .where((p) => p.isNotEmpty)
-          .toList();
-
-      // 4) قسم إلى أسطر حسب الفواصل السطرية
-      final lines = rawText
+      final allLines = rawText
           .split(RegExp(r'\r?\n'))
           .map((l) => l.trim())
           .where((l) => l.isNotEmpty)
           .toList();
 
+      final paras = <String>[];
+      var buffer = '';
+      for (final line in allLines) {
+        buffer = buffer.isEmpty ? line : '$buffer $line';
+        if (RegExp(r'[\.؟!\?]$').hasMatch(line)) {
+          paras.add(buffer.trim());
+          buffer = '';
+        }
+      }
+      if (buffer.isNotEmpty) paras.add(buffer.trim());
+
       setState(() {
+        _lines = allLines;
         _paragraphs = paras;
-        _lines = lines;
       });
     } catch (e) {
       setState(() {
-        _paragraphs = ['حدث خطأ أثناء المعالجة:\n$e'];
         _lines = [];
+        _paragraphs = ['حدث خطأ أثناء المعالجة:\n$e'];
       });
     } finally {
-      setState(() => _busy = false);
+      setState(() => _processing = false);
     }
   }
 
-  Future<void> _readText(String text) async {
+  Future<void> _speak(String text) async {
     final isAr = RegExp(r'[\u0600-\u06FF]').hasMatch(text);
     await _tts.setLanguage(isAr ? 'ar' : 'en-US');
     await _tts.speak(text);
@@ -71,6 +114,7 @@ class _TestRecognitionPageState extends State<TestRecognitionPage> {
 
   @override
   void dispose() {
+    _camCtrl?.dispose();
     _tts.stop();
     super.dispose();
   }
@@ -78,74 +122,89 @@ class _TestRecognitionPageState extends State<TestRecognitionPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('اختبار تقسيم الفقرات والأسطر')),
+      appBar: AppBar(
+        title: const Text('OCR Camera'),
+        actions: [
+          IconButton(
+            icon: Icon(_flashOn ? Icons.flash_on : Icons.flash_off),
+            onPressed: _toggleFlash,
+          ),
+        ],
+      ),
       body: Column(
         children: [
-          const SizedBox(height: 12),
+          if (_cameraReady)
+            AspectRatio(
+              aspectRatio: _camCtrl!.value.aspectRatio,
+              child: CameraPreview(_camCtrl!),
+            )
+          else
+            Container(
+              height: 200,
+              color: Colors.black12,
+              child: const Center(child: CircularProgressIndicator()),
+            ),
 
-          // زرّ التحليل
+          const SizedBox(height: 8),
+
           ElevatedButton.icon(
-            icon: _busy
+            icon: _processing
                 ? const SizedBox(
-                    width: 16, height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.photo),
-            label: Text(_busy ? 'جارٍ التحليل...' : 'حلّل الصورة'),
-            onPressed: _busy ? null : _analyzeImage,
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.camera_alt),
+            label: Text(_processing ? 'جارٍ المعالجة...' : 'التقاط وقراءة'),
+            onPressed: (!_cameraReady || _processing) ? null : _captureAndProcess,
           ),
 
           const Divider(),
 
-          // قائمة الفقرات
+          // الفقرات
           Expanded(
-            flex: 1,
-            child: _busy
-                ? const Center(child: CircularProgressIndicator())
-                : _paragraphs.isEmpty
-                    ? const Center(child: Text('اضغط لتحليل الفقرات'))
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(8),
-                        itemCount: _paragraphs.length,
-                        itemBuilder: (ctx, i) => Card(
-                          margin: const EdgeInsets.symmetric(vertical: 4),
-                          child: ListTile(
-                            title: Text('فقرة ${i+1}'),
-                            subtitle: Text(_paragraphs[i]),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.volume_up),
-                              onPressed: () => _readText(_paragraphs[i]),
-                            ),
-                          ),
+            child: _paragraphs.isEmpty
+                ? const Center(child: Text('اضغط "التقاط وقراءة" لبدء'))
+                : ListView.builder(
+                    padding: const EdgeInsets.all(8),
+                    itemCount: _paragraphs.length,
+                    itemBuilder: (ctx, i) => Card(
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: ListTile(
+                        title: Text('فقرة ${i + 1}'),
+                        subtitle: Text(_paragraphs[i]),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.volume_up),
+                          onPressed: () => _speak(_paragraphs[i]),
                         ),
                       ),
+                    ),
+                  ),
           ),
 
           const Divider(),
 
-          // قائمة الأسطر
+          // الأسطر
           Expanded(
-            flex: 1,
-            child: _busy
-                ? const SizedBox() // أو ابقّي ProgressIndicator
-                : _lines.isEmpty
-                    ? const Center(child: Text('لا توجد أسطر حتى الآن'))
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(8),
-                        itemCount: _lines.length,
-                        itemBuilder: (ctx, i) => Card(
-                          color: Colors.grey[100],
-                          margin: const EdgeInsets.symmetric(vertical: 2),
-                          child: ListTile(
-                            dense: true,
-                            title: Text('سطر ${i+1}'),
-                            subtitle: Text(_lines[i]),
-                            trailing: IconButton(
-                              icon: const Icon(Icons.volume_up),
-                              onPressed: () => _readText(_lines[i]),
-                            ),
-                          ),
+            child: _lines.isEmpty
+                ? const Center(child: Text('لا توجد أسطر بعد'))
+                : ListView.builder(
+                    padding: const EdgeInsets.all(8),
+                    itemCount: _lines.length,
+                    itemBuilder: (ctx, i) => Card(
+                      color: Colors.grey[100],
+                      margin: const EdgeInsets.symmetric(vertical: 2),
+                      child: ListTile(
+                        dense: true,
+                        title: Text('سطر ${i + 1}'),
+                        subtitle: Text(_lines[i]),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.volume_up),
+                          onPressed: () => _speak(_lines[i]),
                         ),
                       ),
+                    ),
+                  ),
           ),
         ],
       ),
